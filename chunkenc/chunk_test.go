@@ -16,28 +16,32 @@ func TestMemChunk(t *testing.T) {
 	lines := bytes.Split(b, []byte("\n"))
 
 	for _, enc := range []Encoding{EncGZIP, EncZLIB, EncSnappy, EncZSTD, EncBZIP2} {
-		t.Run(enc.String(), func(t *testing.T) {
-			chk := NewMemChunk(enc)
-			app, err := chk.Appender()
-			require.NoError(t, err)
+		for _, blockSize := range []int{4 * 1024, 8 * 1024, 16 * 1024, 32 * 1024, 64 * 1024, 128 * 1024} {
+			testName := fmt.Sprintf("%s-%d", enc.String(), blockSize/1024)
+			t.Run(testName, func(t *testing.T) {
+				chk := NewMemChunk(enc)
+				chk.blockSize = blockSize
 
-			for i, l := range lines {
-				app.Append(int64(i), string(l))
-			}
+				app, err := chk.Appender()
+				require.NoError(t, err)
 
-			fmt.Println(float64(len(b))/(1024*1024), float64(len(chk.Bytes()))/(1024*1024))
+				for i, l := range lines {
+					app.Append(int64(i), string(l))
+				}
 
-			it := chk.Iterator()
-			require.NoError(t, err)
+				fmt.Println(float64(len(b))/(1024*1024), float64(len(chk.Bytes()))/(1024*1024))
 
-			for i, l := range lines {
-				require.True(t, it.Next())
+				it := chk.Iterator()
+				require.NoError(t, err)
 
-				ts, str := it.At()
-				require.Equal(t, int64(i), ts)
-				require.Equal(t, string(l), str)
-			}
-		})
+				for i, l := range lines {
+					require.True(t, it.Next())
+
+					ts, str := it.At()
+					require.Equal(t, int64(i), ts)
+					require.Equal(t, string(l), str)
+				}
+			})
+		}
 	}
-
 }

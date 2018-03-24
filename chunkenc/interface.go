@@ -62,6 +62,7 @@ type Iterator interface {
 type CompressionWriter interface {
 	Write(p []byte) (int, error)
 	Close() error
+	Flush() error
 }
 
 // CompressionReader reads the compressed data.

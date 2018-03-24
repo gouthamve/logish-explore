@@ -83,11 +83,11 @@ func NewMemChunk(enc Encoding) *MemChunk {
 		c.cr = func(r io.Reader) (CompressionReader, error) { return snappy.NewReader(r), nil }
 
 	case EncZSTD:
-		c.cw = func(w io.Writer) CompressionWriter { return zstd.NewWriter(w) }
+		c.cw = func(w io.Writer) CompressionWriter { return noopFlushingWriter{zstd.NewWriter(w)} }
 		c.cr = func(r io.Reader) (CompressionReader, error) { return zstd.NewReader(r), nil }
 
 	case EncBZIP2:
-		c.cw = func(w io.Writer) CompressionWriter { cw, _ := bzip2.NewWriter(w, nil); return cw }
+		c.cw = func(w io.Writer) CompressionWriter { cw, _ := bzip2.NewWriter(w, nil); return noopFlushingWriter{cw} }
 		c.cr = func(r io.Reader) (CompressionReader, error) { return bzip2.NewReader(r, nil) }
 
 	default:
@@ -104,12 +104,22 @@ func (c *MemChunk) Bytes() []byte {
 	c.Lock()
 	defer c.Unlock()
 
-	totBytes := make([]byte, (len(c.blocks)+1)*c.blockSize)
+	l := 0
+	for _, b := range c.blocks {
+		l += len(b.b)
+	}
+
+	l += len(c.memBlock.b)
+
+	totBytes := make([]byte, l)
 	off := 0
 	for _, b := range c.blocks {
 		n := copy(totBytes[off:], b.b)
 		off += n
 	}
+
+	n := copy(totBytes[off:], c.memBlock.b)
+	off += n
 
 	return totBytes[:off]
 }
@@ -193,6 +203,8 @@ func (a *memAppender) Append(t int64, s string) {
 	a.block.maxt = t
 
 	a.block.numEntries++
+
+	a.writer.Flush()
 
 	if a.buffer.Len() > a.chunk.blockSize {
 		a.cut()
@@ -369,5 +381,13 @@ func (li *listIterator) At() (int64, string) {
 }
 
 func (li *listIterator) Err() error {
+	return nil
+}
+
+type noopFlushingWriter struct {
+	io.WriteCloser
+}
+
+func (noopFlushingWriter) Flush() error {
 	return nil
 }
