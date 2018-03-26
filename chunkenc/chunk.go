@@ -1,6 +1,7 @@
 package chunkenc
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
@@ -33,7 +34,9 @@ type MemChunk struct {
 }
 
 type block struct {
-	b          []byte
+	b  []byte
+	ts []int64
+
 	entries    []entry
 	numEntries int
 	size       int // size of uncompressed bytes.
@@ -49,7 +52,7 @@ type entry struct {
 // NewMemChunk returns a new in-mem chunk.
 func NewMemChunk(enc Encoding) *MemChunk {
 	c := &MemChunk{
-		blockSize: 32 * 1024, // The blockSize in bytes.
+		blockSize: 500 * 1024 * 1024, // The blockSize in bytes.
 		blocks:    []block{},
 
 		memBlock: &block{},
@@ -61,12 +64,7 @@ func NewMemChunk(enc Encoding) *MemChunk {
 		c.cr = func(r io.Reader) (CompressionReader, error) { return gzip.NewReader(r) }
 	case EncLZ4:
 		c.cw = func(w io.Writer) CompressionWriter {
-			cw := lz4.NewWriter(w)
-			cw.Header.BlockMaxSize = 64 * 1024
-			cw.Header.HighCompression = true
-			cw.Header.BlockDependency = false
-
-			return cw
+			return lz4.NewWriter(w)
 		}
 
 		c.cr = func(r io.Reader) (CompressionReader, error) { return lz4.NewReader(r), nil }
@@ -79,7 +77,7 @@ func NewMemChunk(enc Encoding) *MemChunk {
 		c.cr = func(r io.Reader) (CompressionReader, error) { return zlib.NewReader(r) }
 
 	case EncSnappy:
-		c.cw = func(w io.Writer) CompressionWriter { return snappy.NewWriter(w) }
+		c.cw = func(w io.Writer) CompressionWriter { return snappy.NewBufferedWriter(w) }
 		c.cr = func(r io.Reader) (CompressionReader, error) { return snappy.NewReader(r), nil }
 
 	case EncZSTD:
@@ -101,6 +99,10 @@ func NewMemChunk(enc Encoding) *MemChunk {
 
 // Bytes implements Chunk.
 func (c *MemChunk) Bytes() []byte {
+	if c.app != nil {
+		c.app.cut()
+	}
+
 	c.Lock()
 	defer c.Unlock()
 
@@ -109,17 +111,12 @@ func (c *MemChunk) Bytes() []byte {
 		l += len(b.b)
 	}
 
-	l += len(c.memBlock.b)
-
 	totBytes := make([]byte, l)
 	off := 0
 	for _, b := range c.blocks {
 		n := copy(totBytes[off:], b.b)
 		off += n
 	}
-
-	n := copy(totBytes[off:], c.memBlock.b)
-	off += n
 
 	return totBytes[:off]
 }
@@ -175,24 +172,11 @@ func newMemAppender(chunk *MemChunk) *memAppender {
 }
 
 func (a *memAppender) Append(t int64, s string) {
-	n := binary.PutVarint(a.encBuf[:], t)
-	_, err := a.writer.Write(a.encBuf[:n])
+	_, err := a.writer.Write([]byte(s + "\n"))
 	if err != nil {
 		fmt.Println("WZTF", err)
 	}
-	a.block.size += n
-
-	n = binary.PutVarint(a.encBuf[:], int64(len(s)))
-	_, err = a.writer.Write(a.encBuf[:n])
-	if err != nil {
-		fmt.Println("WZTF", err)
-	}
-	a.block.size += n
-
-	_, err = a.writer.Write([]byte(s))
-	if err != nil {
-		fmt.Println("WZTF", err)
-	}
+	a.block.ts = append(a.block.ts, t)
 	a.block.size += len(s)
 
 	a.block.entries = append(a.block.entries, entry{t, s})
@@ -204,9 +188,7 @@ func (a *memAppender) Append(t int64, s string) {
 
 	a.block.numEntries++
 
-	a.writer.Flush()
-
-	if a.buffer.Len() > a.chunk.blockSize {
+	if a.block.size > a.chunk.blockSize {
 		a.cut()
 	}
 }
@@ -224,8 +206,11 @@ func (a *memAppender) cut() {
 
 	b := make([]byte, len(a.block.b))
 	copy(b, a.block.b)
+	ts := make([]int64, len(a.block.ts))
+	copy(ts, a.block.ts)
 	a.chunk.blocks = append(a.chunk.blocks, block{
 		b:          b,
+		ts:         ts,
 		numEntries: a.block.numEntries,
 		mint:       a.block.mint,
 		maxt:       a.block.maxt,
@@ -235,6 +220,7 @@ func (a *memAppender) cut() {
 	// Reset the block.
 	a.block.entries = a.block.entries[:0]
 	a.block.b = a.block.b[:0]
+	a.block.ts = a.block.ts[:0]
 	a.block.mint = math.MaxInt64
 	a.block.maxt = 0
 	a.block.numEntries = 0
@@ -266,7 +252,7 @@ func (a *memAppender) Close() error {
 type memIterator struct {
 	blocks []block
 
-	it  *listIterator
+	it  Iterator
 	cur entry
 
 	cr func(io.Reader) (CompressionReader, error)
@@ -274,7 +260,10 @@ type memIterator struct {
 
 func newMemIterator(blocks []block, cr func(io.Reader) (CompressionReader, error)) *memIterator {
 	// TODO: Handle nil blocks.
-	it := newListIterator(blocks[0], cr)
+	it, err := newBlockIterator(blocks[0], cr)
+	if err != nil {
+		fmt.Println("err", err)
+	}
 	return &memIterator{
 		blocks: blocks[1:],
 		it:     it,
@@ -293,8 +282,12 @@ func (gi *memIterator) Next() bool {
 		return true
 	}
 
+	var err error
 	if len(gi.blocks) > 0 {
-		gi.it = newListIterator(gi.blocks[0], gi.cr)
+		gi.it, err = newBlockIterator(gi.blocks[0], gi.cr)
+		if err != nil {
+			fmt.Println("err", err)
+		}
 		gi.blocks = gi.blocks[1:]
 
 		return gi.Next()
@@ -311,54 +304,28 @@ func (gi *memIterator) Err() error {
 	return nil
 }
 
-type listIterator struct {
-	entries []entry
-
-	cur entry
-}
-
-func newListIterator(b block, cr func(io.Reader) (CompressionReader, error)) *listIterator {
+func newBlockIterator(b block, cr func(io.Reader) (CompressionReader, error)) (Iterator, error) {
 	if len(b.entries) > 0 {
 		// TODO: Don't make it copy this. Do something about it!
 		// Also, race!
 		return &listIterator{
 			entries: b.entries[:],
-		}
+		}, nil
 	}
 
-	// big alloc!
-	buf := make([]byte, b.size+10)
-	entries := make([]entry, 0, b.numEntries)
-
-	r, _ := cr(bytes.NewBuffer(b.b))
-
-	toRead := b.size
-	buf2 := buf[:]
-	for toRead > 0 {
-		n, err := r.Read(buf2)
-		if err != nil && err != io.EOF {
-			fmt.Println("WTF", err)
-		}
-		toRead -= n
-		buf2 = buf2[n:]
+	r, err := cr(bytes.NewBuffer(b.b))
+	if err != nil {
+		return nil, err
 	}
 
-	for i := 0; i < b.numEntries; i++ {
-		t, n := binary.Varint(buf)
-		buf = buf[n:]
+	s := bufio.NewScanner(r)
+	return newScanIterator(s, b.ts), nil
+}
 
-		len, n := binary.Varint(buf)
-		buf = buf[n:]
+type listIterator struct {
+	entries []entry
 
-		str := string(buf[:len])
-		buf = buf[len:]
-
-		entries = append(entries, entry{t, str})
-	}
-
-	return &listIterator{
-		entries: entries,
-	}
+	cur entry
 }
 
 func (li *listIterator) Seek(int64) bool {
@@ -382,6 +349,42 @@ func (li *listIterator) At() (int64, string) {
 
 func (li *listIterator) Err() error {
 	return nil
+}
+
+type scanIterator struct {
+	s  *bufio.Scanner
+	ts []int64
+
+	curT int64
+}
+
+func newScanIterator(s *bufio.Scanner, ts []int64) *scanIterator {
+	return &scanIterator{
+		s:  s,
+		ts: ts,
+	}
+}
+
+func (si *scanIterator) Seek(int64) bool {
+	return false
+}
+
+func (si *scanIterator) Next() bool {
+	ok := si.s.Scan()
+	if ok {
+		si.curT = si.ts[0]
+		si.ts = si.ts[1:]
+	}
+
+	return ok
+}
+
+func (si *scanIterator) At() (int64, string) {
+	return si.curT, si.s.Text()
+}
+
+func (si *scanIterator) Err() error {
+	return si.s.Err()
 }
 
 type noopFlushingWriter struct {
